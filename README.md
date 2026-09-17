@@ -4,6 +4,42 @@ A Python Wordle solver that plays against the live API at
 [wordle.votee.dev](https://wordle.votee.dev:8000), with a colored terminal
 board. No third-party dependencies -- Python 3 standard library only.
 
+## Getting started
+
+Requires Python 3.9+, nothing else -- no `pip install`, no virtualenv, no
+build step. Run from the repo root so the `src/main.py` path resolves; the
+solver itself needs network access to reach the live API, but the local
+unit tests (`python3 -m unittest discover`) don't.
+
+```bash
+git clone <this-repo-url>
+cd wordle
+
+# Solve a random secret (fixed seed so the same secret persists across all guesses in the game)
+python3 src/main.py --source random --seed 42
+
+# Solve today's daily puzzle
+python3 src/main.py --source daily
+
+# Solve a specific word (useful for testing)
+python3 src/main.py --source word --word mango
+
+# Solve a 7-letter random secret
+python3 src/main.py --source random --seed 42 --size 7
+
+# Use the faster/weaker frequency heuristic instead of entropy
+python3 src/main.py --source random --seed 42 --strategy frequency
+
+# No animation delay between guesses
+python3 src/main.py --source random --seed 42 --delay 0
+
+# Type your own guesses instead of letting the solver play -- the solver's
+# top-10-by-entropy list and its own suggested guess are still shown as a hint
+python3 src/main.py --source word --word mango --mode manual
+```
+
+Full options: `python3 src/main.py --help`.
+
 ## How it picks guesses
 
 Two strategies, selected with `--strategy`:
@@ -61,34 +97,6 @@ against a runaway game). Word length is configurable with `--size`
 (default 5); `--source random`/`--source daily` are capped to `[1, 22]` by
 the API itself, while `--source word` is uncapped and infers `--size` from
 `--word`.
-
-## Usage
-
-```bash
-# Solve a random secret (fixed seed so the same secret persists across all guesses in the game)
-python3 src/main.py --source random --seed 42
-
-# Solve today's daily puzzle
-python3 src/main.py --source daily
-
-# Solve a specific word (useful for testing)
-python3 src/main.py --source word --word mango
-
-# Solve a 7-letter random secret
-python3 src/main.py --source random --seed 42 --size 7
-
-# Use the faster/weaker frequency heuristic instead of entropy
-python3 src/main.py --source random --seed 42 --strategy frequency
-
-# No animation delay between guesses
-python3 src/main.py --source random --seed 42 --delay 0
-
-# Type your own guesses instead of letting the solver play -- the solver's
-# top-10-by-entropy list and its own suggested guess are still shown as a hint
-python3 src/main.py --source word --word mango --mode manual
-```
-
-Full options: `python3 src/main.py --help`.
 
 ## Project layout
 
