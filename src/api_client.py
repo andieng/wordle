@@ -2,6 +2,11 @@
 
 Endpoint behavior (confirmed by live probing, not just the OpenAPI schema):
   - size must be a positive integer; 0 or negative -> Internal Server Error.
+  - /random and /daily only have secret words up to 22 letters long -- size
+    23+ -> Internal Server Error on both (confirmed by probing size 1..22
+    succeeding and 23+ failing on both endpoints). /word/{word} has no such
+    cap since the secret is given directly and no server-side word lookup
+    is needed.
   - seed must be in [0, 2**32 - 1]; outside that range -> Internal Server Error.
   - guess length must exactly equal size (or len(word) for /word/{word}),
     else a plain-text 400 body, not JSON.
@@ -23,6 +28,8 @@ from feedback import ABSENT, CORRECT, PRESENT
 BASE_URL = "https://wordle.votee.dev:8000"
 WORD_SIZE = 5
 MAX_SEED = 2**32 - 1
+MIN_SIZE = 1
+MAX_SIZE = 22  # /random and /daily only; /word/{word} is uncapped.
 
 _RESULT_TO_SCORE = {"absent": ABSENT, "present": PRESENT, "correct": CORRECT}
 
@@ -41,6 +48,11 @@ def _validate_guess(guess: str, expected_length: int) -> None:
 def _validate_seed(seed: int) -> None:
     if not (0 <= seed <= MAX_SEED):
         raise ValueError(f"seed must be in [0, {MAX_SEED}], got {seed}")
+
+
+def _validate_size(size: int) -> None:
+    if not (MIN_SIZE <= size <= MAX_SIZE):
+        raise ValueError(f"size must be in [{MIN_SIZE}, {MAX_SIZE}], got {size}")
 
 
 def _request(path: str, params: dict) -> tuple[int, ...]:
@@ -64,19 +76,21 @@ def _request(path: str, params: dict) -> tuple[int, ...]:
     return tuple(pattern)
 
 
-def guess_random(guess: str, seed: int) -> tuple[int, ...]:
+def guess_random(guess: str, seed: int, size: int = WORD_SIZE) -> tuple[int, ...]:
     """Guess against a random secret determined by `seed` (reuse the same
     seed across every guess in one game -- omitting it draws a new secret
     per call)."""
-    _validate_guess(guess, WORD_SIZE)
+    _validate_size(size)
+    _validate_guess(guess, size)
     _validate_seed(seed)
-    return _request("/random", {"guess": guess, "size": WORD_SIZE, "seed": seed})
+    return _request("/random", {"guess": guess, "size": size, "seed": seed})
 
 
-def guess_daily(guess: str) -> tuple[int, ...]:
+def guess_daily(guess: str, size: int = WORD_SIZE) -> tuple[int, ...]:
     """Guess against today's daily puzzle."""
-    _validate_guess(guess, WORD_SIZE)
-    return _request("/daily", {"guess": guess, "size": WORD_SIZE})
+    _validate_size(size)
+    _validate_guess(guess, size)
+    return _request("/daily", {"guess": guess, "size": size})
 
 
 def guess_word(word: str, guess: str) -> tuple[int, ...]:

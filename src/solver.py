@@ -31,7 +31,7 @@ from collections import Counter
 from math import log2
 from pathlib import Path
 
-from feedback import ABSENT, CORRECT, PRESENT, encode_pattern, score_naive
+from feedback import CORRECT, PRESENT, encode_pattern, score_naive
 from words import ANSWERS_FILE, GUESSES_FILE, WORD_FREQ_FILE, load_answers, load_frequencies, load_guesses
 
 FIRST_GUESS_CACHE = Path(__file__).parent / "data" / "first_guess_cache.json"
@@ -49,6 +49,24 @@ def entropy_of_guess(guess: str, candidates: list[str]) -> float:
     return -sum((c / n) * log2(c / n) for c in buckets.values())
 
 
+def compute_entropies(candidates: list[str], guess_pool: list[str]) -> dict[str, float]:
+    """Shannon entropy (bits) for every guess in `guess_pool` against `candidates`,
+    computed once so callers that need both a ranked list (e.g. a "top 10 by
+    entropy" display) and the best-guess pick don't redo the same work."""
+    return {guess: entropy_of_guess(guess, candidates) for guess in guess_pool}
+
+
+def top_entropy_guesses(
+    candidates: list[str], guess_pool: list[str], n: int = 10, entropies: dict[str, float] | None = None
+) -> list[tuple[str, float]]:
+    """Return the `n` guesses in `guess_pool` with the highest raw entropy
+    against `candidates` (ties broken alphabetically for determinism)."""
+    if entropies is None:
+        entropies = compute_entropies(candidates, guess_pool)
+    ranked = sorted(entropies.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ranked[:n]
+
+
 def entropy_to_expected_score(ent: float) -> float:
     """Regression (from 3Blue1Brown's Wordle analysis) mapping "bits of
     entropy remaining after a guess" to "expected number of further guesses
@@ -59,7 +77,11 @@ def entropy_to_expected_score(ent: float) -> float:
 
 
 def best_entropy_guess(
-    candidates: list[str], guess_pool: list[str], freq: dict[str, float] | None = None, epsilon: float = 1e-9
+    candidates: list[str],
+    guess_pool: list[str],
+    freq: dict[str, float] | None = None,
+    epsilon: float = 1e-9,
+    entropies: dict[str, float] | None = None,
 ) -> str:
     """Return the guess in `guess_pool` minimizing expected total remaining
     guesses against `candidates`, following 3Blue1Brown's own formula:
@@ -71,40 +93,27 @@ def best_entropy_guess(
     guess is itself a candidate (a chance to win outright) else 0 --
     3Blue1Brown's own *default* prior (`get_true_wordle_prior`, a binary
     real-answer indicator) reduces to exactly this uniform 1/n, not a
-    continuous real-word-frequency weighting.
-
-    This is provably almost equivalent to plain entropy maximization (since
-    H0 is fixed per candidate set and the regression is monotonic in H1),
-    except it can let a genuinely large entropy edge for a non-candidate
-    outweigh a candidate's small win-probability credit -- something a
-    boolean "is it a candidate" tie-break can't express. Benchmarked
-    (2,309 games, every answer as the secret) at 3.614 average guesses,
-    2296/2309 wins -- identical to the simpler epsilon/boolean version this
-    replaced, but derived from the calibrated formula instead of an
-    arbitrary threshold.
+    continuous real-word-frequency weighting: benchmarking showed that
+    blending in real frequency (whether into the entropy calculation or
+    just this probability term) measurably hurts average guesses, since a
+    common word's small win-probability credit can outweigh a genuinely
+    stronger split even outside true endgame ties.
 
     Genuine exact ties remain (e.g. 2 remaining candidates always split into
     2 singleton buckets with identical entropy and identical 1/n win
     probability, whichever you guess) and are broken by `freq`, when given:
     prefer the guess more likely to actually be the secret by real-world
     usage, rather than an arbitrary/list-order-dependent pick.
-
-    Note: continuously blending *real* word frequency into this formula
-    (instead of the uniform 1/n above) was tried and benchmarked worse
-    (3.86 vs 3.61 average guesses) -- even only as the win-probability term,
-    with entropy left uniform. A small win-probability credit for a common
-    word can still outweigh a genuinely stronger split at *every* turn, not
-    just true endgame ties, which quietly erodes overall guess quality. See
-    also the module-level note in this file's git history for the fully
-    frequency-weighted-entropy version, which was worse still (3.84 avg).
     """
     n = len(candidates)
     h0 = log2(n)
     candidate_set = set(candidates)
+    if entropies is None:
+        entropies = compute_entropies(candidates, guess_pool)
 
     scores: dict[str, float] = {}
     for guess in guess_pool:
-        h1 = entropy_of_guess(guess, candidates)
+        h1 = entropies[guess]
         prob = (1.0 / n) if guess in candidate_set else 0.0
         scores[guess] = prob * 1 + (1 - prob) * (1 + entropy_to_expected_score(h0 - h1))
 
@@ -151,19 +160,25 @@ def _load_cached_first_guess() -> str | None:
 
 
 class WordleSolver:
-    def __init__(self, strategy: str = "entropy", entropy_max_candidates: int = 2000):
+    def __init__(self, strategy: str = "entropy", entropy_max_candidates: int = 2000, size: int = 5):
         self.strategy = strategy
         self.entropy_max_candidates = entropy_max_candidates
-        self.candidates: list[str] = list(load_answers())
-        self.broad_candidates: list[str] = list(load_guesses())
-        self._full_size = len(self.candidates)
+        self.size = size
+        # The curated word lists are all 5-letter NYT Wordle words -- for any
+        # other size they're filtered down (usually to empty), and the
+        # solver naturally drops straight to the tier-3 constraint model,
+        # which works for any word length.
+        self.candidates: list[str] = [w for w in load_answers() if len(w) == size]
+        self.broad_candidates: list[str] = [w for w in load_guesses() if len(w) == size]
+        self._full_size = len(load_answers()) if size == 5 else -1
         self.freq: dict[str, float] = load_frequencies()
+        self.last_top_entropy: list[tuple[str, float]] = []
 
         # Raw letter/position constraint model -- always kept up to date,
         # used as the last-resort tier once both word lists are exhausted.
         self.known_in: set[str] = set()
         self.known_out: set[str] = set()
-        self.position_letters: list[set[str]] = [set(_ALPHABET) for _ in range(5)]
+        self.position_letters: list[set[str]] = [set(_ALPHABET) for _ in range(size)]
 
     def filter(self, guess: str, pattern: tuple[int, ...]) -> list[str]:
         self.candidates = [c for c in self.candidates if score_naive(guess, c) == pattern]
@@ -189,10 +204,14 @@ class WordleSolver:
 
     def _suggest_from_pool(self, pool: list[str]) -> str:
         if len(pool) == 1:
+            self.last_top_entropy = [(pool[0], 0.0)]
             return pool[0]
         if self.strategy == "frequency" or len(pool) > self.entropy_max_candidates:
+            self.last_top_entropy = []
             return best_frequency_guess(pool)
-        return best_entropy_guess(pool, guess_pool=pool, freq=self.freq)
+        entropies = compute_entropies(pool, pool)
+        self.last_top_entropy = top_entropy_guesses(pool, pool, entropies=entropies)
+        return best_entropy_guess(pool, guess_pool=pool, freq=self.freq, entropies=entropies)
 
     def _fallback_guess(self) -> str:
         """Construct a guess directly from the constraint model, for when the
@@ -202,11 +221,12 @@ class WordleSolver:
         of which slot it was tested in -- so once some positions are already
         resolved, re-confirming their known letter every guess wastes a slot
         that could instead test a brand-new letter. So every guess here fills
-        as many of the 5 slots as possible with untested letters (to learn up
-        to 5 new membership facts per guess), reserving slots only for
-        known-in letters that still need to find their position. Only once
-        the whole alphabet has been tested does it fall back to the known
-        possible letters (which by then should be fully resolved anyway).
+        as many of the `self.size` slots as possible with untested letters
+        (to learn up to `self.size` new membership facts per guess),
+        reserving slots only for known-in letters that still need to find
+        their position. Only once the whole alphabet has been tested does it
+        fall back to the known possible letters (which by then should be
+        fully resolved anyway).
         """
         if self.is_solved():
             return "".join(next(iter(pl)) for pl in self.position_letters)
@@ -215,12 +235,12 @@ class WordleSolver:
         unplaced_known_in = self.known_in - placed
         untested_priority = [l for l in _FREQ_ORDER if l not in self.known_in and l not in self.known_out]
 
-        letters: list[str | None] = [None] * 5
+        letters: list[str | None] = [None] * self.size
         used: set[str] = set()
 
         # Tier 1: place each still-homeless known-in letter at an unresolved
         # position where it's still a valid candidate.
-        for i in range(5):
+        for i in range(self.size):
             if len(self.position_letters[i]) == 1:
                 continue
             for l in sorted(self.position_letters[i]):
@@ -234,7 +254,7 @@ class WordleSolver:
         # untested letter, prioritizing common English letters, to maximize
         # new information from this one guess.
         untested_iter = iter(untested_priority)
-        for i in range(5):
+        for i in range(self.size):
             if letters[i] is not None:
                 continue
             candidate = next((l for l in untested_iter if l not in used), None)
@@ -252,12 +272,14 @@ class WordleSolver:
             if self.strategy == "entropy" and len(self.candidates) == self._full_size:
                 cached = _load_cached_first_guess()
                 if cached is not None:
+                    self.last_top_entropy = []
                     return cached
                 print(
                     "note: no first-guess cache found "
                     "(run scripts/precompute_first_guess.py); "
                     "falling back to the frequency heuristic for this guess"
                 )
+                self.last_top_entropy = []
                 return best_frequency_guess(self.candidates)
             return self._suggest_from_pool(self.candidates)
 
@@ -267,13 +289,14 @@ class WordleSolver:
         # unresolved, prefer the constraint model: every fallback guess is
         # guaranteed to narrow at least one position or eliminate a letter
         # outright, whereas another dictionary guess might be a real word
-        # that simply happens to be wrong (as with "patte"/"tatie" above),
-        # burning an attempt without guaranteed progress.
+        # that simply happens to be wrong, burning an attempt without
+        # guaranteed progress.
         if remaining_attempts is not None and remaining_attempts <= unresolved:
             print(
                 "note: running low on attempts relative to unresolved letters; "
                 "solving directly from letter/position constraints"
             )
+            self.last_top_entropy = []
             return self._fallback_guess()
 
         if self.broad_candidates:
@@ -287,4 +310,5 @@ class WordleSolver:
             "note: secret isn't in either word list (likely a proper noun); "
             "solving directly from letter/position constraints"
         )
+        self.last_top_entropy = []
         return self._fallback_guess()
